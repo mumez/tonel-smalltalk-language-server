@@ -1,5 +1,5 @@
 use tower_lsp::lsp_types::{Position, Range};
-use tree_sitter::{Parser, Query, QueryCursor, Tree};
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct SrcTree {
     src: String,
@@ -11,7 +11,7 @@ impl SrcTree {
         let language = tree_sitter_tonel_smalltalk::language();
         let mut parser = Parser::new();
         parser
-            .set_language(language)
+            .set_language(&language)
             .expect("Error loading tonel_smalltalk grammar");
         let tree = parser
             .parse(&src, None)
@@ -36,7 +36,7 @@ impl SrcTree {
         // Note: r##"..."## is required because the pattern contains "#name" which
         // would prematurely terminate r#"..."#.
         let query = Query::new(
-            language,
+            &language,
             r##"[
                 (class_definition (ston_map (ston_pair
                     (ston_key (ston_symbol) @key (#eq? @key "#name"))
@@ -51,9 +51,8 @@ impl SrcTree {
         let name_idx = query.capture_index_for_name("name")?;
 
         let mut cursor = QueryCursor::new();
-        let (m, _) = cursor
-            .captures(&query, self.tree.root_node(), self.src.as_bytes())
-            .next()?;
+        let mut captures = cursor.captures(&query, self.tree.root_node(), self.src.as_bytes());
+        let (m, _) = captures.next()?;
 
         let name_node = m.captures.iter().find(|c| c.index == name_idx)?.node;
 
