@@ -31,6 +31,10 @@ impl Backend {
         self.workspace.update(uri.clone(), &src_tree);
         self.document_map.insert(uri, src_tree);
     }
+
+    async fn log(&self, level: MessageType, msg: impl Into<String>) {
+        self.client.log_message(level, msg.into()).await;
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -64,12 +68,21 @@ impl LanguageServer for Backend {
             let workspace = Arc::clone(&self.workspace);
             let client = self.client.clone();
             tokio::spawn(async move {
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Workspace scan starting: root_path={}", root_path.display()),
+                    )
+                    .await;
                 let result =
                     tokio::task::spawn_blocking(move || workspace.scan(&root_path)).await;
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(count)) => {
                         client
-                            .log_message(MessageType::INFO, "Workspace scan complete")
+                            .log_message(
+                                MessageType::INFO,
+                                format!("Workspace scan complete: {} classes indexed", count),
+                            )
                             .await
                     }
                     _ => {
@@ -79,6 +92,12 @@ impl LanguageServer for Backend {
                     }
                 }
             });
+        } else {
+            self.log(
+                MessageType::WARNING,
+                "No workspace root: scan skipped (index will be built from opened files)",
+            )
+            .await;
         }
     }
 
@@ -108,46 +127,118 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         let pos = &params.text_document_position_params;
+        let uri = &pos.text_document.uri;
+        let doc_count = self.document_map.len();
 
-        let src_tree = match self.document_map.get(&pos.text_document.uri) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        let point = tree_sitter::Point {
-            row: pos.position.line as usize,
-            column: pos.position.character as usize,
-        };
-
-        let root = src_tree.tree().root_node();
-        let node = match root.descendant_for_point_range(point, point) {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-
-        if node.kind() != "identifier" {
-            return Ok(None);
+        // tree-sitter's Node is not Send, so all tree-sitter work must complete
+        // before the first .await. The outcome enum carries only owned data.
+        enum Outcome {
+            NotInMap,
+            NotIdentifier(String),
+            NotUppercase(String),
+            Lookup(String),
         }
 
-        let ident = match node.utf8_text(src_tree.src().as_bytes()) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        let outcome = {
+            let src_tree = match self.document_map.get(uri) {
+                Some(t) => t,
+                None => {
+                    // Log immediately; this early-return path can't use the helper.
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!(
+                                "goto_definition: uri={} pos={}:{} doc_map={} — document not in map",
+                                uri, pos.position.line, pos.position.character, doc_count
+                            ),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+            };
+
+            let point = tree_sitter::Point {
+                row: pos.position.line as usize,
+                column: pos.position.character as usize,
+            };
+            let root = src_tree.tree().root_node();
+            if let Some(n) = root.descendant_for_point_range(point, point) {
+                let kind = n.kind();
+                if kind != "identifier" {
+                    Outcome::NotIdentifier(kind.to_string())
+                } else {
+                    match n.utf8_text(src_tree.src().as_bytes()) {
+                        Ok(s) if s.starts_with(|c: char| c.is_uppercase()) => {
+                            Outcome::Lookup(s.to_string())
+                        }
+                        Ok(s) => Outcome::NotUppercase(s.to_string()),
+                        Err(_) => Outcome::NotInMap,
+                    }
+                }
+            } else {
+                Outcome::NotInMap
+            }
         };
 
-        // Only class names (uppercase first character) trigger go-to-definition.
-        if !ident.starts_with(|c: char| c.is_uppercase()) {
-            return Ok(None);
-        }
+        self.log(
+            MessageType::INFO,
+            format!(
+                "goto_definition: uri={} pos={}:{} doc_map={}",
+                uri, pos.position.line, pos.position.character, doc_count
+            ),
+        )
+        .await;
 
-        let ident = ident.to_string();
-        drop(src_tree);
-
-        match self.workspace.find_class(&ident) {
-            Some((url, range)) => Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                uri: url,
-                range,
-            }))),
-            None => Ok(None),
+        match outcome {
+            Outcome::NotInMap => Ok(None),
+            Outcome::NotIdentifier(kind) => {
+                self.log(
+                    MessageType::INFO,
+                    format!("goto_definition: node kind='{}' (not identifier) — skip", kind),
+                )
+                .await;
+                Ok(None)
+            }
+            Outcome::NotUppercase(ident) => {
+                self.log(
+                    MessageType::INFO,
+                    format!("goto_definition: '{}' not uppercase — skip", ident),
+                )
+                .await;
+                Ok(None)
+            }
+            Outcome::Lookup(ident) => {
+                let class_count = self.workspace.class_count();
+                self.log(
+                    MessageType::INFO,
+                    format!(
+                        "goto_definition: looking up '{}' (indexed_classes={})",
+                        ident, class_count
+                    ),
+                )
+                .await;
+                match self.workspace.find_class(&ident) {
+                    Some((url, range)) => {
+                        self.log(
+                            MessageType::INFO,
+                            format!("goto_definition: found '{}' at {}", ident, url),
+                        )
+                        .await;
+                        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: url,
+                            range,
+                        })))
+                    }
+                    None => {
+                        self.log(
+                            MessageType::WARNING,
+                            format!("goto_definition: '{}' not found in class index", ident),
+                        )
+                        .await;
+                        Ok(None)
+                    }
+                }
+            }
         }
     }
 }

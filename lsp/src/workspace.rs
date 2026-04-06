@@ -18,8 +18,9 @@ impl Workspace {
     }
 
     /// Walks all `.st` files under `root`, parses each with SrcTree,
-    /// and populates the class index.
-    pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
+    /// and populates the class index. Returns the number of classes indexed.
+    pub fn scan(&self, root: &Path) -> anyhow::Result<usize> {
+        let before = self.class_index.len();
         for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -37,7 +38,12 @@ impl Workspace {
                 }
             }
         }
-        Ok(())
+        Ok(self.class_index.len() - before)
+    }
+
+    /// Returns the number of classes currently in the index.
+    pub fn class_count(&self) -> usize {
+        self.class_index.len()
     }
 
     /// Updates the index entry for a single document (call on did_open/did_change).
