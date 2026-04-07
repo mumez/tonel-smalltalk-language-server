@@ -162,7 +162,16 @@ impl LanguageServer for Backend {
                 column: pos.position.character as usize,
             };
             let root = src_tree.tree().root_node();
-            if let Some(n) = root.descendant_for_point_range(point, point) {
+            // When the cursor is just past an identifier (e.g. at ')'), try column-1 as fallback.
+            let node = root.descendant_for_point_range(point, point).and_then(|n| {
+                if n.kind() != "identifier" && point.column > 0 {
+                    let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
+                    root.descendant_for_point_range(prev, prev)
+                } else {
+                    Some(n)
+                }
+            });
+            if let Some(n) = node {
                 let kind = n.kind();
                 if kind != "identifier" {
                     Outcome::NotIdentifier(kind.to_string())

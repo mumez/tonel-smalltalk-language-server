@@ -41,9 +41,15 @@ impl SrcTree {
                 (class_definition (ston_map (ston_pair
                     (ston_key (ston_symbol) @key (#eq? @key "#name"))
                     (ston_value (ston_symbol) @name))))
+                (class_definition (ston_map (ston_pair
+                    (ston_key (ston_symbol) @key (#eq? @key "#name"))
+                    (ston_value (string) @name))))
                 (trait_definition (ston_map (ston_pair
                     (ston_key (ston_symbol) @key (#eq? @key "#name"))
                     (ston_value (ston_symbol) @name))))
+                (trait_definition (ston_map (ston_pair
+                    (ston_key (ston_symbol) @key (#eq? @key "#name"))
+                    (ston_value (string) @name))))
             ]"##,
         )
         .ok()?;
@@ -56,11 +62,13 @@ impl SrcTree {
 
         let name_node = m.captures.iter().find(|c| c.index == name_idx)?.node;
 
-        let class_name = name_node
-            .utf8_text(self.src.as_bytes())
-            .ok()?
-            .trim_start_matches('#')
-            .to_string();
+        let raw = name_node.utf8_text(self.src.as_bytes()).ok()?;
+        let class_name = if raw.starts_with('#') {
+            raw.trim_start_matches('#').to_string()
+        } else {
+            // string format: 'ClassName'
+            raw.trim_matches('\'').to_string()
+        };
 
         // Walk up to find the enclosing class_definition or trait_definition node
         // in order to get its Range for go-to-definition.
@@ -97,6 +105,16 @@ mod tests {
     #[test]
     fn test_class_definition_extracts_name() {
         let src = "Class { #name: #Foo, #superclass: #Object }";
+        let tree = SrcTree::new(src.to_string());
+        let result = tree.defined_class();
+        assert!(result.is_some());
+        let (name, _range) = result.unwrap();
+        assert_eq!(name, "Foo");
+    }
+
+    #[test]
+    fn test_class_definition_with_string_name() {
+        let src = "Class { #name : 'Foo', #superclass : 'Object' }";
         let tree = SrcTree::new(src.to_string());
         let result = tree.defined_class();
         assert!(result.is_some());
