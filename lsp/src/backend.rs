@@ -164,7 +164,7 @@ impl LanguageServer for Backend {
             let root = src_tree.tree().root_node();
             // When the cursor is just past an identifier (e.g. at ')'), try column-1 as fallback.
             let node = root.descendant_for_point_range(point, point).and_then(|n| {
-                if n.kind() != "identifier" && point.column > 0 {
+                if n.kind() != "identifier" && n.kind() != "string" && point.column > 0 {
                     let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
                     root.descendant_for_point_range(prev, prev)
                 } else {
@@ -173,9 +173,7 @@ impl LanguageServer for Backend {
             });
             if let Some(n) = node {
                 let kind = n.kind();
-                if kind != "identifier" {
-                    Outcome::NotIdentifier(kind.to_string())
-                } else {
+                if kind == "identifier" {
                     match n.utf8_text(src_tree.src().as_bytes()) {
                         Ok(s) if s.starts_with(|c: char| c.is_uppercase()) => {
                             Outcome::Lookup(s.to_string())
@@ -183,6 +181,20 @@ impl LanguageServer for Backend {
                         Ok(s) => Outcome::NotUppercase(s.to_string()),
                         Err(_) => Outcome::NotInMap,
                     }
+                } else if kind == "string" {
+                    match n.utf8_text(src_tree.src().as_bytes()) {
+                        Ok(raw) => {
+                            let s = raw.trim_matches('\'');
+                            if s.starts_with(|c: char| c.is_uppercase()) {
+                                Outcome::Lookup(s.to_string())
+                            } else {
+                                Outcome::NotUppercase(s.to_string())
+                            }
+                        }
+                        Err(_) => Outcome::NotInMap,
+                    }
+                } else {
+                    Outcome::NotIdentifier(kind.to_string())
                 }
             } else {
                 Outcome::NotInMap
