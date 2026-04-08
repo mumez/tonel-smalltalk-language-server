@@ -6,7 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::src_tree::SrcTree;
+use crate::src_tree::{normalize_tonel_name, SrcTree};
 use crate::workspace::Workspace;
 
 pub struct Backend {
@@ -164,7 +164,8 @@ impl LanguageServer for Backend {
             let root = src_tree.tree().root_node();
             // When the cursor is just past an identifier (e.g. at ')'), try column-1 as fallback.
             let node = root.descendant_for_point_range(point, point).and_then(|n| {
-                if n.kind() != "identifier" && n.kind() != "string" && point.column > 0 {
+                let k = n.kind();
+                if k != "identifier" && k != "string" && k != "symbol" && point.column > 0 {
                     let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
                     root.descendant_for_point_range(prev, prev)
                 } else {
@@ -173,18 +174,10 @@ impl LanguageServer for Backend {
             });
             if let Some(n) = node {
                 let kind = n.kind();
-                if kind == "identifier" {
-                    match n.utf8_text(src_tree.src().as_bytes()) {
-                        Ok(s) if s.starts_with(|c: char| c.is_uppercase()) => {
-                            Outcome::Lookup(s.to_string())
-                        }
-                        Ok(s) => Outcome::NotUppercase(s.to_string()),
-                        Err(_) => Outcome::NotInMap,
-                    }
-                } else if kind == "string" {
+                if kind == "identifier" || kind == "string" || kind == "symbol" {
                     match n.utf8_text(src_tree.src().as_bytes()) {
                         Ok(raw) => {
-                            let s = raw.trim_matches('\'');
+                            let s = normalize_tonel_name(raw);
                             if s.starts_with(|c: char| c.is_uppercase()) {
                                 Outcome::Lookup(s.to_string())
                             } else {

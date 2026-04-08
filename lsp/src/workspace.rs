@@ -94,6 +94,18 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_fixture_directory() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/tonel/Dummy-Core");
+        let workspace = Workspace::new();
+        let count = workspace.scan(&fixture_dir).unwrap();
+        assert!(count >= 4, "expected at least 4 classes, got {}", count);
+        assert!(workspace.find_class("DmError").is_some());
+        assert!(workspace.find_class("DmSymbolName").is_some());
+        assert!(workspace.find_class("DmQuotedSymbolName").is_some());
+    }
+
+    #[test]
     fn test_update_indexes_single_document() {
         let workspace = Workspace::new();
         let url = Url::parse("file:///tmp/Foo.st").unwrap();

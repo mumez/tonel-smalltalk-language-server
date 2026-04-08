@@ -63,12 +63,7 @@ impl SrcTree {
         let name_node = m.captures.iter().find(|c| c.index == name_idx)?.node;
 
         let raw = name_node.utf8_text(self.src.as_bytes()).ok()?;
-        let class_name = if raw.starts_with('#') {
-            raw.trim_start_matches('#').to_string()
-        } else {
-            // string format: 'ClassName'
-            raw.trim_matches('\'').to_string()
-        };
+        let class_name = normalize_tonel_name(raw).to_string();
 
         // Walk up to find the enclosing class_definition or trait_definition node
         // in order to get its Range for go-to-definition.
@@ -98,9 +93,29 @@ impl SrcTree {
     }
 }
 
+/// Strip Tonel name decoration and return a plain class name.
+///
+/// Handles all three forms that Tonel allows for `#name`:
+///   `#ClassName`    -> `ClassName`
+///   `#'ClassName'`  -> `ClassName`
+///   `'ClassName'`   -> `ClassName`
+///   `ClassName`     -> `ClassName` (identifier, no-op)
+pub fn normalize_tonel_name(raw: &str) -> &str {
+    raw.trim_start_matches('#').trim_matches('\'')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_fixture_class(relative_path: &str, expected: &str) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+        let src = std::fs::read_to_string(&fixture).expect("fixture not found");
+        let tree = SrcTree::new(src);
+        let result = tree.defined_class();
+        assert!(result.is_some(), "expected class definition in {relative_path}");
+        assert_eq!(result.unwrap().0, expected);
+    }
 
     #[test]
     fn test_class_definition_extracts_name() {
@@ -123,6 +138,16 @@ mod tests {
     }
 
     #[test]
+    fn test_class_definition_with_quoted_symbol_name() {
+        let src = "Class { #name : #'Foo', #superclass : #Object }";
+        let tree = SrcTree::new(src.to_string());
+        let result = tree.defined_class();
+        assert!(result.is_some());
+        let (name, _range) = result.unwrap();
+        assert_eq!(name, "Foo");
+    }
+
+    #[test]
     fn test_trait_definition_extracts_name() {
         let src = "Trait { #name: #MyTrait }";
         let tree = SrcTree::new(src.to_string());
@@ -137,5 +162,23 @@ mod tests {
         let src = "Foo >> bar [\n    ^42\n]";
         let tree = SrcTree::new(src.to_string());
         assert!(tree.defined_class().is_none());
+    }
+
+    #[test]
+    fn test_fixture_string_name_class() {
+        assert_fixture_class("test/tonel/Dummy-Core/DmError.class.st", "DmError");
+    }
+
+    #[test]
+    fn test_fixture_symbol_name_class() {
+        assert_fixture_class("test/tonel/Dummy-Core/DmSymbolName.class.st", "DmSymbolName");
+    }
+
+    #[test]
+    fn test_fixture_quoted_symbol_name_class() {
+        assert_fixture_class(
+            "test/tonel/Dummy-Core/DmQuotedSymbolName.class.st",
+            "DmQuotedSymbolName",
+        );
     }
 }
