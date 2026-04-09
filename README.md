@@ -6,6 +6,7 @@ A Language Server Protocol (LSP) implementation for [Tonel-Smalltalk](https://gi
 
 - Syntax highlighting (via Zed native tree-sitter integration)
 - Go-to-definition for class names
+- Find all references for class names (supports `#ClassName`, `#'ClassName'`, `'ClassName'` forms)
 
 ## Requirements
 

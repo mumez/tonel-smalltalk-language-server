@@ -1,5 +1,15 @@
+use std::collections::HashMap;
+
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+
+/// Result of resolving the token at a cursor position to a class name.
+pub enum ClassAtPos {
+    NotNode,
+    NotIdentifier(String),
+    NotUppercase(String),
+    Found(String),
+}
 
 pub struct SrcTree {
     src: String,
@@ -19,12 +29,92 @@ impl SrcTree {
         Self { src, tree }
     }
 
-    pub fn src(&self) -> &str {
-        &self.src
+    /// Resolves the token at `pos` to a class name (uppercase-first identifier/symbol/string).
+    pub fn class_at_position(&self, pos: &Position) -> ClassAtPos {
+        let point = tree_sitter::Point {
+            row: pos.line as usize,
+            column: pos.character as usize,
+        };
+        let is_token =
+            |k: &str| matches!(k, "identifier" | "string" | "symbol" | "ston_symbol");
+        let root = self.tree.root_node();
+        let node = root.descendant_for_point_range(point, point).and_then(|n| {
+            if !is_token(n.kind()) && point.column > 0 {
+                let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
+                root.descendant_for_point_range(prev, prev)
+            } else {
+                Some(n)
+            }
+        });
+        let Some(n) = node else {
+            return ClassAtPos::NotNode;
+        };
+        let kind = n.kind();
+        if !is_token(kind) {
+            return ClassAtPos::NotIdentifier(kind.to_string());
+        }
+        match n.utf8_text(self.src.as_bytes()) {
+            Ok(raw) => {
+                let s = normalize_class_name(raw);
+                if s.starts_with(|c: char| c.is_uppercase()) {
+                    ClassAtPos::Found(s.to_string())
+                } else {
+                    ClassAtPos::NotUppercase(s.to_string())
+                }
+            }
+            Err(_) => ClassAtPos::NotNode,
+        }
     }
 
-    pub fn tree(&self) -> &Tree {
-        &self.tree
+    /// Returns all class-name occurrences in this file, grouped by name.
+    /// Covers `ClassName`, `#ClassName`, `#'ClassName'`, and `'ClassName'` forms.
+    pub fn all_class_references(&self) -> HashMap<String, Vec<Range>> {
+        let mut map: HashMap<String, Vec<Range>> = HashMap::new();
+        let root_node = self.tree.root_node();
+        let mut cursor = root_node.walk();
+
+        'outer: loop {
+            let node = cursor.node();
+            let kind = node.kind();
+            if matches!(kind, "identifier" | "string" | "symbol" | "ston_symbol") {
+                if let Ok(raw) = node.utf8_text(self.src.as_bytes()) {
+                    let name = normalize_class_name(raw);
+                    if name.starts_with(|c: char| c.is_uppercase()) {
+                        let start = node.start_position();
+                        let end = node.end_position();
+                        map.entry(name.to_string()).or_default().push(Range {
+                            start: Position {
+                                line: start.row as u32,
+                                character: start.column as u32,
+                            },
+                            end: Position {
+                                line: end.row as u32,
+                                character: end.column as u32,
+                            },
+                        });
+                    }
+                }
+            }
+
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    break 'outer;
+                }
+            }
+        }
+
+        map
+    }
+
+    /// Returns all LSP Ranges where `class_name` appears.
+    pub fn find_class_references(&self, class_name: &str) -> Vec<Range> {
+        self.all_class_references().remove(class_name).unwrap_or_default()
     }
 
     /// Returns the class or trait name defined in this file and the LSP Range of
@@ -172,6 +262,31 @@ mod tests {
     #[test]
     fn test_fixture_symbol_name_class() {
         assert_fixture_class("test/tonel/Dummy-Core/DmSymbolName.class.st", "DmSymbolName");
+    }
+
+    #[test]
+    fn test_find_class_references_all_forms() {
+        // Method file referencing a class in all three forms.
+        let src = "Foo >> bar [\n    | a b c |\n    a := #ClassName new.\n    b := #'ClassName' new.\n    c := 'ClassName' new.\n    ^a\n]";
+        let tree = SrcTree::new(src.to_string());
+        let refs = tree.find_class_references("ClassName");
+        assert_eq!(refs.len(), 3, "expected 3 references, got {:?}", refs);
+    }
+
+    #[test]
+    fn test_find_class_references_in_class_definition() {
+        // Class definition file — the class name itself and superclass are both references.
+        let src = "Class { #name: #Foo, #superclass: #Object }";
+        let tree = SrcTree::new(src.to_string());
+        let refs = tree.find_class_references("Foo");
+        assert!(!refs.is_empty(), "expected at least one reference to Foo");
+    }
+
+    #[test]
+    fn test_find_class_references_no_match() {
+        let src = "Foo >> bar [ ^#Bar new ]";
+        let tree = SrcTree::new(src.to_string());
+        assert!(tree.find_class_references("Baz").is_empty());
     }
 
     #[test]

@@ -6,8 +6,17 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::src_tree::{normalize_class_name, SrcTree};
+use crate::src_tree::{ClassAtPos, SrcTree};
 use crate::workspace::Workspace;
+
+fn range_contains(outer: &Range, inner: &Range) -> bool {
+    let start_ok = outer.start.line < inner.start.line
+        || (outer.start.line == inner.start.line
+            && outer.start.character <= inner.start.character);
+    let end_ok = outer.end.line > inner.end.line
+        || (outer.end.line == inner.end.line && outer.end.character >= inner.end.character);
+    start_ok && end_ok
+}
 
 pub struct Backend {
     client: Client,
@@ -35,6 +44,18 @@ impl Backend {
     async fn log(&self, level: MessageType, msg: impl Into<String>) {
         self.client.log_message(level, msg.into()).await;
     }
+
+    /// Resolves the class name at the cursor position. Returns `(class_name, doc_count)`
+    /// on success, or logs and returns `None` on failure.
+    /// Must be called inside a scope block so the DashMap guard is dropped before any `.await`.
+    fn resolve_class_at(&self, uri: &Url, pos: &Position) -> (usize, Option<ClassAtPos>) {
+        let doc_count = self.document_map.len();
+        let result = self
+            .document_map
+            .get(uri)
+            .map(|t| t.class_at_position(pos));
+        (doc_count, result)
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -56,6 +77,7 @@ impl LanguageServer for Backend {
                     },
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -122,77 +144,104 @@ impl LanguageServer for Backend {
         self.document_map.remove(&params.text_document.uri);
     }
 
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let pos = &params.text_document_position;
+        let uri = &pos.text_document.uri;
+        let include_declaration = params.context.include_declaration;
+
+        // tree-sitter's Node is not Send; resolve before any .await.
+        let (doc_count, class_at_pos) = self.resolve_class_at(uri, &pos.position);
+
+        self.log(
+            MessageType::INFO,
+            format!(
+                "references: uri={} pos={}:{} doc_map={} include_declaration={}",
+                uri, pos.position.line, pos.position.character, doc_count, include_declaration
+            ),
+        )
+        .await;
+
+        let class_name = match class_at_pos {
+            None => {
+                self.log(
+                    MessageType::WARNING,
+                    format!(
+                        "references: uri={} pos={}:{} doc_map={} — document not in map",
+                        uri, pos.position.line, pos.position.character, doc_count
+                    ),
+                )
+                .await;
+                return Ok(None);
+            }
+            Some(ClassAtPos::NotNode) => return Ok(None),
+            Some(ClassAtPos::NotIdentifier(kind)) => {
+                self.log(
+                    MessageType::INFO,
+                    format!("references: node kind='{}' (not identifier) — skip", kind),
+                )
+                .await;
+                return Ok(None);
+            }
+            Some(ClassAtPos::NotUppercase(ident)) => {
+                self.log(
+                    MessageType::INFO,
+                    format!("references: '{}' not uppercase — skip", ident),
+                )
+                .await;
+                return Ok(None);
+            }
+            Some(ClassAtPos::Found(name)) => name,
+        };
+
+        self.log(
+            MessageType::INFO,
+            format!(
+                "references: looking up '{}' (indexed_classes={})",
+                class_name,
+                self.workspace.class_count()
+            ),
+        )
+        .await;
+
+        let mut result = self.workspace.find_references(&class_name);
+
+        if !include_declaration {
+            if let Some((def_url, def_range)) = self.workspace.find_class(&class_name) {
+                result.retain(|loc| !(loc.uri == def_url && range_contains(&def_range, &loc.range)));
+            }
+        }
+
+        if result.is_empty() {
+            self.log(
+                MessageType::WARNING,
+                format!("references: '{}' — no references found", class_name),
+            )
+            .await;
+        } else {
+            self.log(
+                MessageType::INFO,
+                format!(
+                    "references: '{}' found {} locations (include_declaration={})",
+                    class_name,
+                    result.len(),
+                    include_declaration
+                ),
+            )
+            .await;
+        }
+
+        Ok(Some(result))
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         let pos = &params.text_document_position_params;
         let uri = &pos.text_document.uri;
-        let doc_count = self.document_map.len();
 
-        // tree-sitter's Node is not Send, so all tree-sitter work must complete
-        // before the first .await. The outcome enum carries only owned data.
-        enum Outcome {
-            NotInMap,
-            NotIdentifier(String),
-            NotUppercase(String),
-            Lookup(String),
-        }
-
-        let outcome = {
-            let src_tree = match self.document_map.get(uri) {
-                Some(t) => t,
-                None => {
-                    // Log immediately; this early-return path can't use the helper.
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!(
-                                "goto_definition: uri={} pos={}:{} doc_map={} — document not in map",
-                                uri, pos.position.line, pos.position.character, doc_count
-                            ),
-                        )
-                        .await;
-                    return Ok(None);
-                }
-            };
-
-            let point = tree_sitter::Point {
-                row: pos.position.line as usize,
-                column: pos.position.character as usize,
-            };
-            let root = src_tree.tree().root_node();
-            // When the cursor is just past an identifier (e.g. at ')'), try column-1 as fallback.
-            let node = root.descendant_for_point_range(point, point).and_then(|n| {
-                let k = n.kind();
-                if k != "identifier" && k != "string" && k != "symbol" && point.column > 0 {
-                    let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
-                    root.descendant_for_point_range(prev, prev)
-                } else {
-                    Some(n)
-                }
-            });
-            if let Some(n) = node {
-                let kind = n.kind();
-                if kind == "identifier" || kind == "string" || kind == "symbol" {
-                    match n.utf8_text(src_tree.src().as_bytes()) {
-                        Ok(raw) => {
-                            let s = normalize_class_name(raw);
-                            if s.starts_with(|c: char| c.is_uppercase()) {
-                                Outcome::Lookup(s.to_string())
-                            } else {
-                                Outcome::NotUppercase(s.to_string())
-                            }
-                        }
-                        Err(_) => Outcome::NotInMap,
-                    }
-                } else {
-                    Outcome::NotIdentifier(kind.to_string())
-                }
-            } else {
-                Outcome::NotInMap
-            }
-        };
+        // tree-sitter's Node is not Send; resolve before any .await.
+        let (doc_count, class_at_pos) = self.resolve_class_at(uri, &pos.position);
 
         self.log(
             MessageType::INFO,
@@ -203,55 +252,64 @@ impl LanguageServer for Backend {
         )
         .await;
 
-        match outcome {
-            Outcome::NotInMap => Ok(None),
-            Outcome::NotIdentifier(kind) => {
+        let class_name = match class_at_pos {
+            None => {
+                self.log(
+                    MessageType::WARNING,
+                    format!(
+                        "goto_definition: uri={} pos={}:{} doc_map={} — document not in map",
+                        uri, pos.position.line, pos.position.character, doc_count
+                    ),
+                )
+                .await;
+                return Ok(None);
+            }
+            Some(ClassAtPos::NotNode) => return Ok(None),
+            Some(ClassAtPos::NotIdentifier(kind)) => {
                 self.log(
                     MessageType::INFO,
                     format!("goto_definition: node kind='{}' (not identifier) — skip", kind),
                 )
                 .await;
-                Ok(None)
+                return Ok(None);
             }
-            Outcome::NotUppercase(ident) => {
+            Some(ClassAtPos::NotUppercase(ident)) => {
                 self.log(
                     MessageType::INFO,
                     format!("goto_definition: '{}' not uppercase — skip", ident),
                 )
                 .await;
-                Ok(None)
+                return Ok(None);
             }
-            Outcome::Lookup(ident) => {
-                let class_count = self.workspace.class_count();
+            Some(ClassAtPos::Found(name)) => name,
+        };
+
+        self.log(
+            MessageType::INFO,
+            format!(
+                "goto_definition: looking up '{}' (indexed_classes={})",
+                class_name,
+                self.workspace.class_count()
+            ),
+        )
+        .await;
+
+        match self.workspace.find_class(&class_name) {
+            Some((url, range)) => {
                 self.log(
                     MessageType::INFO,
-                    format!(
-                        "goto_definition: looking up '{}' (indexed_classes={})",
-                        ident, class_count
-                    ),
+                    format!("goto_definition: found '{}' at {}", class_name, url),
                 )
                 .await;
-                match self.workspace.find_class(&ident) {
-                    Some((url, range)) => {
-                        self.log(
-                            MessageType::INFO,
-                            format!("goto_definition: found '{}' at {}", ident, url),
-                        )
-                        .await;
-                        Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: url,
-                            range,
-                        })))
-                    }
-                    None => {
-                        self.log(
-                            MessageType::WARNING,
-                            format!("goto_definition: '{}' not found in class index", ident),
-                        )
-                        .await;
-                        Ok(None)
-                    }
-                }
+                Ok(Some(GotoDefinitionResponse::Scalar(Location { uri: url, range })))
+            }
+            None => {
+                self.log(
+                    MessageType::WARNING,
+                    format!("goto_definition: '{}' not found in class index", class_name),
+                )
+                .await;
+                Ok(None)
             }
         }
     }
