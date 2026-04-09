@@ -63,7 +63,7 @@ impl SrcTree {
         let name_node = m.captures.iter().find(|c| c.index == name_idx)?.node;
 
         let raw = name_node.utf8_text(self.src.as_bytes()).ok()?;
-        let class_name = normalize_tonel_name(raw).to_string();
+        let class_name = normalize_class_name(raw).to_string();
 
         // Walk up to find the enclosing class_definition or trait_definition node
         // in order to get its Range for go-to-definition.
@@ -100,7 +100,7 @@ impl SrcTree {
 ///   `#'ClassName'`  -> `ClassName`
 ///   `'ClassName'`   -> `ClassName`
 ///   `ClassName`     -> `ClassName` (identifier, no-op)
-pub fn normalize_tonel_name(raw: &str) -> &str {
+pub fn normalize_class_name(raw: &str) -> &str {
     raw.trim_start_matches('#').trim_matches('\'')
 }
 

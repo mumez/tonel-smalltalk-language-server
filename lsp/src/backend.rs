@@ -6,7 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::src_tree::{normalize_tonel_name, SrcTree};
+use crate::src_tree::{normalize_class_name, SrcTree};
 use crate::workspace::Workspace;
 
 pub struct Backend {
@@ -177,7 +177,7 @@ impl LanguageServer for Backend {
                 if kind == "identifier" || kind == "string" || kind == "symbol" {
                     match n.utf8_text(src_tree.src().as_bytes()) {
                         Ok(raw) => {
-                            let s = normalize_tonel_name(raw);
+                            let s = normalize_class_name(raw);
                             if s.starts_with(|c: char| c.is_uppercase()) {
                                 Outcome::Lookup(s.to_string())
                             } else {
