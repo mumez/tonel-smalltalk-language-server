@@ -3,11 +3,13 @@ use std::path::Path;
 use tower_lsp::lsp_types::{Location, Range, Url};
 use walkdir::WalkDir;
 
-use crate::src_tree::SrcTree;
+use crate::src_tree::{ClassInfo, SrcTree};
 
 pub struct Workspace {
     /// Maps class_name -> (defining file URL, definition Range)
     class_index: DashMap<String, (Url, Range)>,
+    /// Maps class_name -> ClassInfo (hover metadata)
+    class_info_index: DashMap<String, ClassInfo>,
     /// Maps class_name -> all locations where that name appears across the workspace
     references_index: DashMap<String, Vec<Location>>,
     /// Maps file URL -> class names referenced in that file (for incremental update)
@@ -18,6 +20,7 @@ impl Workspace {
     pub fn new() -> Self {
         Self {
             class_index: DashMap::new(),
+            class_info_index: DashMap::new(),
             references_index: DashMap::new(),
             file_refs: DashMap::new(),
         }
@@ -41,7 +44,10 @@ impl Workspace {
     /// Updates the indexes for a single document (call on did_open/did_change).
     pub fn update(&self, url: Url, src_tree: &SrcTree) {
         if let Some((class_name, range)) = src_tree.defined_class() {
-            self.class_index.insert(class_name, (url.clone(), range));
+            self.class_index.insert(class_name.clone(), (url.clone(), range));
+            if let Some(info) = src_tree.class_info() {
+                self.class_info_index.insert(class_name, info);
+            }
         }
 
         // Remove stale references from this file.
@@ -69,6 +75,28 @@ impl Workspace {
             }
             self.file_refs.insert(url, referenced);
         }
+    }
+
+    /// Returns the ClassInfo for the named class/trait, or None if unknown.
+    pub fn find_class_info(&self, name: &str) -> Option<ClassInfo> {
+        self.class_info_index.get(name).map(|e| e.value().clone())
+    }
+
+    /// Returns all (class_name, is_inst_var) pairs for classes that declare `var_name`.
+    /// `true` = instance variable, `false` = class variable.
+    pub fn find_var_owners(&self, var_name: &str) -> Vec<(String, bool)> {
+        let mut owners = Vec::new();
+        for entry in self.class_info_index.iter() {
+            let info = entry.value();
+            if info.inst_vars.iter().any(|v| v == var_name) {
+                owners.push((info.name.clone(), true));
+            }
+            if info.class_vars.iter().any(|v| v == var_name) {
+                owners.push((info.name.clone(), false));
+            }
+        }
+        owners.sort_by(|a, b| a.0.cmp(&b.0));
+        owners
     }
 
     /// Looks up a class name and returns its definition location, or None if unknown.
@@ -182,6 +210,48 @@ mod tests {
         assert!(result.is_some());
         let (found_url, _range) = result.unwrap();
         assert_eq!(found_url, url);
+    }
+
+    #[test]
+    fn test_find_class_info_after_scan() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/tonel/Dummy-Core");
+        let workspace = Workspace::new();
+        workspace.scan(&fixture_dir).unwrap();
+
+        let info = workspace.find_class_info("DmSubError").expect("DmSubError should have info");
+        assert_eq!(info.kind, "Class");
+        assert!(info.inst_vars.contains(&"errorPrefix".to_string()));
+        assert_eq!(info.superclass.as_deref(), Some("DmError"));
+    }
+
+    #[test]
+    fn test_find_var_owners() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Foo.st"),
+            "Class { #name: #Foo, #superclass: #Object, #instVars: ['x', 'y'] }",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("Bar.st"),
+            "Class { #name: #Bar, #superclass: #Object, #classVars: ['x'] }",
+        ).unwrap();
+
+        let workspace = Workspace::new();
+        workspace.scan(dir.path()).unwrap();
+
+        let owners = workspace.find_var_owners("x");
+        assert_eq!(owners.len(), 2);
+        let inst: Vec<_> = owners.iter().filter(|(_, inst)| *inst).collect();
+        let cls: Vec<_> = owners.iter().filter(|(_, inst)| !inst).collect();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(cls.len(), 1);
+        assert_eq!(inst[0].0, "Foo");
+        assert_eq!(cls[0].0, "Bar");
+
+        let y_owners = workspace.find_var_owners("y");
+        assert_eq!(y_owners.len(), 1);
+        assert!(y_owners[0].1);
     }
 
     #[test]
