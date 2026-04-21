@@ -78,6 +78,7 @@ impl LanguageServer for Backend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -142,6 +143,63 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.document_map.remove(&params.text_document.uri);
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let pos = &params.text_document_position_params;
+        let uri = &pos.text_document.uri;
+
+        let (_, class_at_pos) = self.resolve_class_at(uri, &pos.position);
+
+        let markdown = match class_at_pos {
+            Some(ClassAtPos::Found(name)) => {
+                self.workspace.find_class_info(&name).map(|info| {
+                    let mut lines = Vec::new();
+                    match info.superclass.as_deref() {
+                        Some(sc) => lines.push(format!("**{}** `{}` ▸ `{}`", info.kind, info.name, sc)),
+                        None => lines.push(format!("**{}** `{}`", info.kind, info.name)),
+                    }
+                    if !info.inst_vars.is_empty() {
+                        let vars = info.inst_vars.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ");
+                        lines.push(format!("\ninstVars: {}", vars));
+                    }
+                    if !info.class_vars.is_empty() {
+                        let vars = info.class_vars.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ");
+                        lines.push(format!("classVars: {}", vars));
+                    }
+                    lines.join("\n")
+                })
+            }
+            Some(ClassAtPos::NotUppercase(name)) => {
+                let owners = self.workspace.find_var_owners(&name);
+                if owners.is_empty() {
+                    None
+                } else {
+                    let mut inst_owners: Vec<&str> = Vec::new();
+                    let mut class_owners: Vec<&str> = Vec::new();
+                    for (class_name, is_inst) in &owners {
+                        if *is_inst { inst_owners.push(class_name); } else { class_owners.push(class_name); }
+                    }
+                    let mut lines = Vec::new();
+                    if !inst_owners.is_empty() {
+                        lines.push(format!("instVar of {}", inst_owners.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ")));
+                    }
+                    if !class_owners.is_empty() {
+                        lines.push(format!("classVar of {}", class_owners.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ")));
+                    }
+                    if lines.is_empty() { None } else { Some(lines.join("\n")) }
+                }
+            }
+            _ => None,
+        };
+
+        Ok(markdown.map(|text| Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: text,
+            }),
+            range: None,
+        }))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
