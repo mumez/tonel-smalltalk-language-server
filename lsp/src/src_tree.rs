@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use tower_lsp::lsp_types::{Position, Range};
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 /// Metadata extracted from a class or trait definition file.
 #[derive(Clone, Debug)]
@@ -125,6 +125,63 @@ impl SrcTree {
     /// Returns all LSP Ranges where `class_name` appears.
     pub fn find_class_references(&self, class_name: &str) -> Vec<Range> {
         self.all_class_references().remove(class_name).unwrap_or_default()
+    }
+
+    /// Returns all syntax error diagnostics derived from the tree-sitter parse result.
+    /// Uses ERROR nodes (unexpected tokens) and MISSING nodes (absent expected tokens).
+    pub fn syntax_errors(&self) -> Vec<Diagnostic> {
+        let root = self.tree.root_node();
+        if !root.has_error() {
+            return Vec::new();
+        }
+
+        let mut diagnostics = Vec::new();
+        let mut cursor = root.walk();
+
+        'outer: loop {
+            let node = cursor.node();
+
+            if node.is_missing() {
+                diagnostics.push(make_error_diagnostic(
+                    node_to_range(&node),
+                    format!("Missing '{}'", node.kind()),
+                ));
+            } else if node.is_error() {
+                let raw = node.utf8_text(self.src.as_bytes()).unwrap_or("").trim();
+                let msg = if raw.is_empty() {
+                    "Syntax error".to_string()
+                } else {
+                    let display: String = raw.chars().take(50).collect();
+                    let suffix = if raw.chars().count() > 50 { "..." } else { "" };
+                    format!("Syntax error: unexpected '{}{}'", display, suffix)
+                };
+                diagnostics.push(make_error_diagnostic(node_to_range(&node), msg));
+                // Skip children of ERROR nodes to avoid cascading reports.
+                loop {
+                    if cursor.goto_next_sibling() {
+                        break;
+                    }
+                    if !cursor.goto_parent() {
+                        break 'outer;
+                    }
+                }
+                continue;
+            }
+
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    break 'outer;
+                }
+            }
+        }
+
+        diagnostics
     }
 
     /// Returns metadata for the class or trait defined in this file, or None if none.
@@ -265,6 +322,25 @@ impl SrcTree {
                 },
             },
         ))
+    }
+}
+
+fn node_to_range(node: &Node) -> Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    Range {
+        start: Position { line: start.row as u32, character: start.column as u32 },
+        end: Position { line: end.row as u32, character: end.column as u32 },
+    }
+}
+
+fn make_error_diagnostic(range: Range, message: String) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("tonel-smalltalk".to_string()),
+        message,
+        ..Default::default()
     }
 }
 
@@ -417,6 +493,42 @@ mod tests {
             "test/tonel/Dummy-Core/DmQuotedSymbolName.class.st",
             "DmQuotedSymbolName",
         );
+    }
+
+    #[test]
+    fn test_syntax_errors_clean_class_definition() {
+        let src = "Class { #name: #Foo, #superclass: #Object }";
+        let tree = SrcTree::new(src.to_string());
+        assert!(tree.syntax_errors().is_empty());
+    }
+
+    #[test]
+    fn test_syntax_errors_clean_fixture() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/tonel/Dummy-Core/DmError.class.st");
+        let src = std::fs::read_to_string(&fixture).expect("fixture not found");
+        let tree = SrcTree::new(src);
+        assert!(tree.syntax_errors().is_empty());
+    }
+
+    #[test]
+    fn test_syntax_errors_unclosed_brace() {
+        let src = "Class { #name: #Foo, #superclass: #Object";
+        let tree = SrcTree::new(src.to_string());
+        let errors = tree.syntax_errors();
+        assert!(!errors.is_empty(), "expected at least one diagnostic");
+        assert!(errors.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+    }
+
+    #[test]
+    fn test_syntax_errors_source_field() {
+        let src = "!!!garbage!!!";
+        let tree = SrcTree::new(src.to_string());
+        let errors = tree.syntax_errors();
+        assert!(!errors.is_empty());
+        for d in &errors {
+            assert_eq!(d.source.as_deref(), Some("tonel-smalltalk"));
+        }
     }
 
     #[test]

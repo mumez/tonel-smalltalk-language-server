@@ -38,7 +38,9 @@ impl Backend {
     async fn on_change(&self, uri: Url, text: String) {
         let src_tree = SrcTree::new(text);
         self.workspace.update(uri.clone(), &src_tree);
-        self.document_map.insert(uri, src_tree);
+        let diagnostics = src_tree.syntax_errors();
+        self.document_map.insert(uri.clone(), src_tree);
+        self.client.publish_diagnostics(uri, diagnostics, None).await;
     }
 
     async fn log(&self, level: MessageType, msg: impl Into<String>) {
@@ -142,7 +144,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.document_map.remove(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.document_map.remove(&uri);
+        self.client.publish_diagnostics(uri, vec![], None).await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
