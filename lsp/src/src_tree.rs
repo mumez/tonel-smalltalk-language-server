@@ -3,6 +3,16 @@ use std::collections::HashMap;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+/// Metadata extracted from a class or trait definition file.
+#[derive(Clone, Debug)]
+pub struct ClassInfo {
+    pub kind: String,           // "Class" or "Trait"
+    pub name: String,
+    pub superclass: Option<String>,
+    pub inst_vars: Vec<String>,
+    pub class_vars: Vec<String>,
+}
+
 /// Result of resolving the token at a cursor position to a class name.
 pub enum ClassAtPos {
     NotNode,
@@ -174,6 +184,81 @@ impl SrcTree {
         diagnostics
     }
 
+    /// Returns metadata for the class or trait defined in this file, or None if none.
+    pub fn class_info(&self) -> Option<ClassInfo> {
+        let root = self.tree.root_node();
+
+        // Tree: source_file → definition → class_definition/trait_definition
+        let def_node = find_class_or_trait_node(root)?;
+
+        let kind = if def_node.kind() == "class_definition" { "Class" } else { "Trait" };
+
+        let ston_map = (0..def_node.named_child_count())
+            .filter_map(|i| def_node.named_child(i as u32))
+            .find(|n| n.kind() == "ston_map")?;
+
+        let mut name: Option<String> = None;
+        let mut superclass: Option<String> = None;
+        let mut inst_vars = Vec::new();
+        let mut class_vars = Vec::new();
+
+        for i in 0..ston_map.named_child_count() {
+            let Some(pair) = ston_map.named_child(i as u32) else { continue };
+            if pair.kind() != "ston_pair" { continue; }
+
+            let key_node = (0..pair.named_child_count())
+                .filter_map(|j| pair.named_child(j as u32))
+                .find(|n| n.kind() == "ston_key");
+            let val_node = (0..pair.named_child_count())
+                .filter_map(|j| pair.named_child(j as u32))
+                .find(|n| n.kind() == "ston_value");
+            let (Some(kn), Some(vn)) = (key_node, val_node) else { continue };
+
+            let key: &str = (0..kn.named_child_count())
+                .filter_map(|j| kn.named_child(j as u32))
+                .next()
+                .and_then(|s| s.utf8_text(self.src.as_bytes()).ok())
+                .map(normalize_class_name)
+                .unwrap_or("");
+
+            let Some(actual) = (0..vn.named_child_count())
+                .filter_map(|j| vn.named_child(j as u32))
+                .next()
+            else { continue };
+
+            match key {
+                "name" => {
+                    if let Ok(raw) = actual.utf8_text(self.src.as_bytes()) {
+                        name = Some(normalize_class_name(raw).to_string());
+                    }
+                }
+                "superclass" => {
+                    if let Ok(raw) = actual.utf8_text(self.src.as_bytes()) {
+                        let sc = normalize_class_name(raw);
+                        if !sc.is_empty() {
+                            superclass = Some(sc.to_string());
+                        }
+                    }
+                }
+                "instVars" => {
+                    inst_vars = extract_ston_array_strings(actual, self.src.as_bytes());
+                }
+                "classVars" => {
+                    class_vars = extract_ston_array_strings(actual, self.src.as_bytes());
+                }
+                _ => {}
+            }
+        }
+
+        Some(ClassInfo {
+            kind: kind.to_string(),
+            name: name?,
+            superclass,
+            inst_vars,
+            class_vars,
+        })
+    }
+
     /// Returns the class or trait name defined in this file and the LSP Range of
     /// its definition node, or None if this file does not contain a definition.
     pub fn defined_class(&self) -> Option<(String, Range)> {
@@ -257,6 +342,43 @@ fn make_error_diagnostic(range: Range, message: String) -> Diagnostic {
         message,
         ..Default::default()
     }
+}
+
+/// Finds the first `class_definition` or `trait_definition` node via DFS.
+fn find_class_or_trait_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if matches!(node.kind(), "class_definition" | "trait_definition") {
+        return Some(node);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            if let Some(found) = find_class_or_trait_node(child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Extracts string values from a `ston_list` node (e.g., instVars list).
+/// Tree: ston_list → ston_value → (string | ston_symbol | identifier)
+fn extract_ston_array_strings(node: tree_sitter::Node, src: &[u8]) -> Vec<String> {
+    if node.kind() != "ston_list" {
+        return Vec::new();
+    }
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i as u32))
+        // each child is a ston_value; get its first named child (the actual value)
+        .filter_map(|sv| {
+            if sv.kind() == "ston_value" {
+                sv.named_child(0)
+            } else {
+                Some(sv)
+            }
+        })
+        .filter_map(|n| n.utf8_text(src).ok())
+        .map(|raw| normalize_class_name(raw).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Strip Tonel name decoration and return a plain class name.
@@ -407,5 +529,47 @@ mod tests {
         for d in &errors {
             assert_eq!(d.source.as_deref(), Some("tonel-smalltalk"));
         }
+    }
+
+    #[test]
+    fn test_class_info_basic() {
+        let src = "Class { #name: #Foo, #superclass: #Object }";
+        let tree = SrcTree::new(src.to_string());
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.kind, "Class");
+        assert_eq!(info.name, "Foo");
+        assert_eq!(info.superclass.as_deref(), Some("Object"));
+        assert!(info.inst_vars.is_empty());
+        assert!(info.class_vars.is_empty());
+    }
+
+    #[test]
+    fn test_class_info_with_inst_vars() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/tonel/Dummy-Core/DmGenericError.class.st");
+        let src = std::fs::read_to_string(&fixture).unwrap();
+        let tree = SrcTree::new(src);
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.kind, "Class");
+        assert_eq!(info.name, "DmSubError");
+        assert_eq!(info.superclass.as_deref(), Some("DmError"));
+        assert!(info.inst_vars.contains(&"errorPrefix".to_string()), "expected errorPrefix in inst_vars: {:?}", info.inst_vars);
+    }
+
+    #[test]
+    fn test_class_info_trait() {
+        let src = "Trait { #name: #MyTrait }";
+        let tree = SrcTree::new(src.to_string());
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.kind, "Trait");
+        assert_eq!(info.name, "MyTrait");
+        assert!(info.superclass.is_none());
+    }
+
+    #[test]
+    fn test_class_info_method_file_returns_none() {
+        let src = "Foo >> bar [ ^42 ]";
+        let tree = SrcTree::new(src.to_string());
+        assert!(tree.class_info().is_none());
     }
 }
