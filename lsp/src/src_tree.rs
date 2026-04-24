@@ -6,11 +6,12 @@ use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 /// Metadata extracted from a class or trait definition file.
 #[derive(Clone, Debug)]
 pub struct ClassInfo {
-    pub kind: String,           // "Class" or "Trait"
+    pub kind: String, // "Class" or "Trait"
     pub name: String,
     pub superclass: Option<String>,
     pub inst_vars: Vec<String>,
     pub class_vars: Vec<String>,
+    pub class_inst_vars: Vec<String>,
 }
 
 /// Result of resolving the token at a cursor position to a class name.
@@ -19,6 +20,12 @@ pub enum ClassAtPos {
     NotIdentifier(String),
     NotUppercase(String),
     Found(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MethodSide {
+    Instance,
+    Class,
 }
 
 pub struct SrcTree {
@@ -45,12 +52,14 @@ impl SrcTree {
             row: pos.line as usize,
             column: pos.character as usize,
         };
-        let is_token =
-            |k: &str| matches!(k, "identifier" | "string" | "symbol" | "ston_symbol");
+        let is_token = |k: &str| matches!(k, "identifier" | "string" | "symbol" | "ston_symbol");
         let root = self.tree.root_node();
         let node = root.descendant_for_point_range(point, point).and_then(|n| {
             if !is_token(n.kind()) && point.column > 0 {
-                let prev = tree_sitter::Point { row: point.row, column: point.column - 1 };
+                let prev = tree_sitter::Point {
+                    row: point.row,
+                    column: point.column - 1,
+                };
                 root.descendant_for_point_range(prev, prev)
             } else {
                 Some(n)
@@ -73,6 +82,43 @@ impl SrcTree {
                 }
             }
             Err(_) => ClassAtPos::NotNode,
+        }
+    }
+
+    /// Returns method side at cursor position if inside a method definition.
+    pub fn method_side_at_position(&self, pos: &Position) -> Option<MethodSide> {
+        let point = tree_sitter::Point {
+            row: pos.line as usize,
+            column: pos.character as usize,
+        };
+        let root = self.tree.root_node();
+        let node = root.descendant_for_point_range(point, point).or_else(|| {
+            if point.column > 0 {
+                let prev = tree_sitter::Point {
+                    row: point.row,
+                    column: point.column - 1,
+                };
+                root.descendant_for_point_range(prev, prev)
+            } else {
+                None
+            }
+        })?;
+
+        let mut cur = node;
+        loop {
+            if cur.kind() == "method_definition" {
+                break;
+            }
+            cur = cur.parent()?;
+        }
+
+        let method_ref = (0..cur.named_child_count())
+            .filter_map(|i| cur.named_child(i as u32))
+            .find(|n| n.kind() == "method_reference")?;
+        if method_ref.child_by_field_name("class_side").is_some() {
+            Some(MethodSide::Class)
+        } else {
+            Some(MethodSide::Instance)
         }
     }
 
@@ -124,7 +170,9 @@ impl SrcTree {
 
     /// Returns all LSP Ranges where `class_name` appears.
     pub fn find_class_references(&self, class_name: &str) -> Vec<Range> {
-        self.all_class_references().remove(class_name).unwrap_or_default()
+        self.all_class_references()
+            .remove(class_name)
+            .unwrap_or_default()
     }
 
     /// Returns all syntax error diagnostics derived from the tree-sitter parse result.
@@ -191,7 +239,11 @@ impl SrcTree {
         // Tree: source_file → definition → class_definition/trait_definition
         let def_node = find_class_or_trait_node(root)?;
 
-        let kind = if def_node.kind() == "class_definition" { "Class" } else { "Trait" };
+        let kind = if def_node.kind() == "class_definition" {
+            "Class"
+        } else {
+            "Trait"
+        };
 
         let ston_map = (0..def_node.named_child_count())
             .filter_map(|i| def_node.named_child(i as u32))
@@ -201,10 +253,15 @@ impl SrcTree {
         let mut superclass: Option<String> = None;
         let mut inst_vars = Vec::new();
         let mut class_vars = Vec::new();
+        let mut class_inst_vars = Vec::new();
 
         for i in 0..ston_map.named_child_count() {
-            let Some(pair) = ston_map.named_child(i as u32) else { continue };
-            if pair.kind() != "ston_pair" { continue; }
+            let Some(pair) = ston_map.named_child(i as u32) else {
+                continue;
+            };
+            if pair.kind() != "ston_pair" {
+                continue;
+            }
 
             let key_node = (0..pair.named_child_count())
                 .filter_map(|j| pair.named_child(j as u32))
@@ -212,7 +269,9 @@ impl SrcTree {
             let val_node = (0..pair.named_child_count())
                 .filter_map(|j| pair.named_child(j as u32))
                 .find(|n| n.kind() == "ston_value");
-            let (Some(kn), Some(vn)) = (key_node, val_node) else { continue };
+            let (Some(kn), Some(vn)) = (key_node, val_node) else {
+                continue;
+            };
 
             let key: &str = (0..kn.named_child_count())
                 .filter_map(|j| kn.named_child(j as u32))
@@ -224,7 +283,9 @@ impl SrcTree {
             let Some(actual) = (0..vn.named_child_count())
                 .filter_map(|j| vn.named_child(j as u32))
                 .next()
-            else { continue };
+            else {
+                continue;
+            };
 
             match key {
                 "name" => {
@@ -246,6 +307,9 @@ impl SrcTree {
                 "classVars" => {
                     class_vars = extract_ston_array_strings(actual, self.src.as_bytes());
                 }
+                "classInstVars" => {
+                    class_inst_vars = extract_ston_array_strings(actual, self.src.as_bytes());
+                }
                 _ => {}
             }
         }
@@ -256,6 +320,7 @@ impl SrcTree {
             superclass,
             inst_vars,
             class_vars,
+            class_inst_vars,
         })
     }
 
@@ -329,8 +394,14 @@ fn node_to_range(node: &Node) -> Range {
     let start = node.start_position();
     let end = node.end_position();
     Range {
-        start: Position { line: start.row as u32, character: start.column as u32 },
-        end: Position { line: end.row as u32, character: end.column as u32 },
+        start: Position {
+            line: start.row as u32,
+            character: start.column as u32,
+        },
+        end: Position {
+            line: end.row as u32,
+            character: end.column as u32,
+        },
     }
 }
 
@@ -401,7 +472,10 @@ mod tests {
         let src = std::fs::read_to_string(&fixture).expect("fixture not found");
         let tree = SrcTree::new(src);
         let result = tree.defined_class();
-        assert!(result.is_some(), "expected class definition in {relative_path}");
+        assert!(
+            result.is_some(),
+            "expected class definition in {relative_path}"
+        );
         assert_eq!(result.unwrap().0, expected);
     }
 
@@ -459,7 +533,10 @@ mod tests {
 
     #[test]
     fn test_fixture_symbol_name_class() {
-        assert_fixture_class("test/tonel/Dummy-Core/DmSymbolName.class.st", "DmSymbolName");
+        assert_fixture_class(
+            "test/tonel/Dummy-Core/DmSymbolName.class.st",
+            "DmSymbolName",
+        );
     }
 
     #[test]
@@ -517,7 +594,9 @@ mod tests {
         let tree = SrcTree::new(src.to_string());
         let errors = tree.syntax_errors();
         assert!(!errors.is_empty(), "expected at least one diagnostic");
-        assert!(errors.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+        assert!(errors
+            .iter()
+            .all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
     }
 
     #[test]
@@ -541,6 +620,7 @@ mod tests {
         assert_eq!(info.superclass.as_deref(), Some("Object"));
         assert!(info.inst_vars.is_empty());
         assert!(info.class_vars.is_empty());
+        assert!(info.class_inst_vars.is_empty());
     }
 
     #[test]
@@ -553,7 +633,11 @@ mod tests {
         assert_eq!(info.kind, "Class");
         assert_eq!(info.name, "DmSubError");
         assert_eq!(info.superclass.as_deref(), Some("DmError"));
-        assert!(info.inst_vars.contains(&"errorPrefix".to_string()), "expected errorPrefix in inst_vars: {:?}", info.inst_vars);
+        assert!(
+            info.inst_vars.contains(&"errorPrefix".to_string()),
+            "expected errorPrefix in inst_vars: {:?}",
+            info.inst_vars
+        );
     }
 
     #[test]
@@ -571,5 +655,30 @@ mod tests {
         let src = "Foo >> bar [ ^42 ]";
         let tree = SrcTree::new(src.to_string());
         assert!(tree.class_info().is_none());
+    }
+
+    #[test]
+    fn test_class_info_with_class_inst_vars() {
+        let src = "Class { #name: #Foo, #superclass: #Object, #classInstVars: ['x'] }";
+        let tree = SrcTree::new(src.to_string());
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.name, "Foo");
+        assert_eq!(info.class_inst_vars, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn test_method_side_at_position() {
+        let src = "Class { #name: #Foo, #superclass: #Object }\n\nFoo class >> bar [\n    ^x\n]\n\nFoo >> baz [\n    ^x\n]";
+        let tree = SrcTree::new(src.to_string());
+        let class_side = tree.method_side_at_position(&Position {
+            line: 3,
+            character: 5,
+        });
+        let instance_side = tree.method_side_at_position(&Position {
+            line: 7,
+            character: 5,
+        });
+        assert_eq!(class_side, Some(MethodSide::Class));
+        assert_eq!(instance_side, Some(MethodSide::Instance));
     }
 }

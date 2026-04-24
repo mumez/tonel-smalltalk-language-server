@@ -7,12 +7,11 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::src_tree::{ClassAtPos, SrcTree};
-use crate::workspace::Workspace;
+use crate::workspace::{VarScope, Workspace};
 
 fn range_contains(outer: &Range, inner: &Range) -> bool {
     let start_ok = outer.start.line < inner.start.line
-        || (outer.start.line == inner.start.line
-            && outer.start.character <= inner.start.character);
+        || (outer.start.line == inner.start.line && outer.start.character <= inner.start.character);
     let end_ok = outer.end.line > inner.end.line
         || (outer.end.line == inner.end.line && outer.end.character >= inner.end.character);
     start_ok && end_ok
@@ -40,7 +39,9 @@ impl Backend {
         self.workspace.update(uri.clone(), &src_tree);
         let diagnostics = src_tree.syntax_errors();
         self.document_map.insert(uri.clone(), src_tree);
-        self.client.publish_diagnostics(uri, diagnostics, None).await;
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 
     async fn log(&self, level: MessageType, msg: impl Into<String>) {
@@ -52,10 +53,7 @@ impl Backend {
     /// Must be called inside a scope block so the DashMap guard is dropped before any `.await`.
     fn resolve_class_at(&self, uri: &Url, pos: &Position) -> (usize, Option<ClassAtPos>) {
         let doc_count = self.document_map.len();
-        let result = self
-            .document_map
-            .get(uri)
-            .map(|t| t.class_at_position(pos));
+        let result = self.document_map.get(uri).map(|t| t.class_at_position(pos));
         (doc_count, result)
     }
 }
@@ -99,8 +97,7 @@ impl LanguageServer for Backend {
                         format!("Workspace scan starting: root_path={}", root_path.display()),
                     )
                     .await;
-                let result =
-                    tokio::task::spawn_blocking(move || workspace.scan(&root_path)).await;
+                let result = tokio::task::spawn_blocking(move || workspace.scan(&root_path)).await;
                 match result {
                     Ok(Ok(count)) => {
                         client
@@ -156,42 +153,58 @@ impl LanguageServer for Backend {
         let (_, class_at_pos) = self.resolve_class_at(uri, &pos.position);
 
         let markdown = match class_at_pos {
-            Some(ClassAtPos::Found(name)) => {
-                self.workspace.find_class_info(&name).map(|info| {
-                    let mut lines = Vec::new();
-                    match info.superclass.as_deref() {
-                        Some(sc) => lines.push(format!("**{}** `{}` ▸ `{}`", info.kind, info.name, sc)),
-                        None => lines.push(format!("**{}** `{}`", info.kind, info.name)),
-                    }
-                    if !info.inst_vars.is_empty() {
-                        let vars = info.inst_vars.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ");
-                        lines.push(format!("\ninstVars: {}", vars));
-                    }
-                    if !info.class_vars.is_empty() {
-                        let vars = info.class_vars.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ");
-                        lines.push(format!("classVars: {}", vars));
-                    }
-                    lines.join("\n")
-                })
-            }
+            Some(ClassAtPos::Found(name)) => self.workspace.find_class_info(&name).map(|info| {
+                let mut lines = Vec::new();
+                match info.superclass.as_deref() {
+                    Some(sc) => lines.push(format!("**{}** `{}` ▸ `{}`", info.kind, info.name, sc)),
+                    None => lines.push(format!("**{}** `{}`", info.kind, info.name)),
+                }
+                if !info.inst_vars.is_empty() {
+                    let vars = info
+                        .inst_vars
+                        .iter()
+                        .map(|v| format!("`{}`", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!("\ninstVars: {}", vars));
+                }
+                if !info.class_vars.is_empty() {
+                    let vars = info
+                        .class_vars
+                        .iter()
+                        .map(|v| format!("`{}`", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!("classVars: {}", vars));
+                }
+                lines.join("\n")
+            }),
             Some(ClassAtPos::NotUppercase(name)) => {
-                let owners = self.workspace.find_var_owners(&name);
+                let method_side = self
+                    .document_map
+                    .get(uri)
+                    .and_then(|t| t.method_side_at_position(&pos.position));
+                let owners = self.workspace.find_var_owners(&name, method_side);
                 if owners.is_empty() {
                     None
                 } else {
-                    let mut inst_owners: Vec<&str> = Vec::new();
-                    let mut class_owners: Vec<&str> = Vec::new();
-                    for (class_name, is_inst) in &owners {
-                        if *is_inst { inst_owners.push(class_name); } else { class_owners.push(class_name); }
-                    }
                     let mut lines = Vec::new();
-                    if !inst_owners.is_empty() {
-                        lines.push(format!("instVar of {}", inst_owners.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ")));
+                    for (class_name, scope) in owners {
+                        let scope_label = match scope {
+                            VarScope::Instance => "instance variable",
+                            VarScope::ClassVariable => "class variable",
+                            VarScope::ClassInstance => "class instance variable",
+                        };
+                        lines.push(format!(
+                            "`{}` ( {} of `{}` )",
+                            name, scope_label, class_name
+                        ));
                     }
-                    if !class_owners.is_empty() {
-                        lines.push(format!("classVar of {}", class_owners.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ")));
+                    if lines.is_empty() {
+                        None
+                    } else {
+                        Some(lines.join("\n"))
                     }
-                    if lines.is_empty() { None } else { Some(lines.join("\n")) }
                 }
             }
             _ => None,
@@ -269,7 +282,8 @@ impl LanguageServer for Backend {
 
         if !include_declaration {
             if let Some((def_url, def_range)) = self.workspace.find_class(&class_name) {
-                result.retain(|loc| !(loc.uri == def_url && range_contains(&def_range, &loc.range)));
+                result
+                    .retain(|loc| !(loc.uri == def_url && range_contains(&def_range, &loc.range)));
             }
         }
 
@@ -330,7 +344,10 @@ impl LanguageServer for Backend {
             Some(ClassAtPos::NotIdentifier(kind)) => {
                 self.log(
                     MessageType::INFO,
-                    format!("goto_definition: node kind='{}' (not identifier) — skip", kind),
+                    format!(
+                        "goto_definition: node kind='{}' (not identifier) — skip",
+                        kind
+                    ),
                 )
                 .await;
                 return Ok(None);
@@ -363,7 +380,10 @@ impl LanguageServer for Backend {
                     format!("goto_definition: found '{}' at {}", class_name, url),
                 )
                 .await;
-                Ok(Some(GotoDefinitionResponse::Scalar(Location { uri: url, range })))
+                Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: url,
+                    range,
+                })))
             }
             None => {
                 self.log(

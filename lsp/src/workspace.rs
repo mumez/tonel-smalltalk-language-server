@@ -3,7 +3,14 @@ use std::path::Path;
 use tower_lsp::lsp_types::{Location, Range, Url};
 use walkdir::WalkDir;
 
-use crate::src_tree::{ClassInfo, SrcTree};
+use crate::src_tree::{ClassInfo, MethodSide, SrcTree};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VarScope {
+    Instance,
+    ClassVariable,
+    ClassInstance,
+}
 
 pub struct Workspace {
     /// Maps class_name -> (defining file URL, definition Range)
@@ -44,7 +51,8 @@ impl Workspace {
     /// Updates the indexes for a single document (call on did_open/did_change).
     pub fn update(&self, url: Url, src_tree: &SrcTree) {
         if let Some((class_name, range)) = src_tree.defined_class() {
-            self.class_index.insert(class_name.clone(), (url.clone(), range));
+            self.class_index
+                .insert(class_name.clone(), (url.clone(), range));
             if let Some(info) = src_tree.class_info() {
                 self.class_info_index.insert(class_name, info);
             }
@@ -82,26 +90,36 @@ impl Workspace {
         self.class_info_index.get(name).map(|e| e.value().clone())
     }
 
-    /// Returns all (class_name, is_inst_var) pairs for classes that declare `var_name`.
-    /// `true` = instance variable, `false` = class variable.
-    pub fn find_var_owners(&self, var_name: &str) -> Vec<(String, bool)> {
+    /// Returns all (class_name, scope) pairs for classes that declare `var_name`.
+    pub fn find_var_owners(
+        &self,
+        var_name: &str,
+        method_side: Option<MethodSide>,
+    ) -> Vec<(String, VarScope)> {
         let mut owners = Vec::new();
         for entry in self.class_info_index.iter() {
             let info = entry.value();
-            if info.inst_vars.iter().any(|v| v == var_name) {
-                owners.push((info.name.clone(), true));
+            let allow_instance = !matches!(method_side, Some(MethodSide::Class));
+            let allow_class_side = !matches!(method_side, Some(MethodSide::Instance));
+            if allow_instance && info.inst_vars.iter().any(|v| v == var_name) {
+                owners.push((info.name.clone(), VarScope::Instance));
             }
             if info.class_vars.iter().any(|v| v == var_name) {
-                owners.push((info.name.clone(), false));
+                owners.push((info.name.clone(), VarScope::ClassVariable));
+            }
+            if allow_class_side && info.class_inst_vars.iter().any(|v| v == var_name) {
+                owners.push((info.name.clone(), VarScope::ClassInstance));
             }
         }
-        owners.sort_by(|a, b| a.0.cmp(&b.0));
+        owners.sort_by(|a, b| a.0.cmp(&b.0).then((a.1 as u8).cmp(&(b.1 as u8))));
         owners
     }
 
     /// Looks up a class name and returns its definition location, or None if unknown.
     pub fn find_class(&self, name: &str) -> Option<(Url, Range)> {
-        self.class_index.get(name).map(|entry| entry.value().clone())
+        self.class_index
+            .get(name)
+            .map(|entry| entry.value().clone())
     }
 
     /// Returns all locations where `class_name` appears across the workspace.
@@ -120,8 +138,7 @@ fn walk_st_files(root: &Path) -> impl Iterator<Item = (Url, SrcTree)> + '_ {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_type().is_file()
-                && e.path().extension().and_then(|s| s.to_str()) == Some("st")
+            e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("st")
         })
         .filter_map(|e| {
             let path = e.path().to_owned();
@@ -167,8 +184,8 @@ mod tests {
 
     #[test]
     fn test_scan_fixture_directory() {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test/tonel/Dummy-Core");
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test/tonel/Dummy-Core");
         let workspace = Workspace::new();
         let count = workspace.scan(&fixture_dir).unwrap();
         assert!(count >= 4, "expected at least 4 classes, got {}", count);
@@ -195,7 +212,11 @@ mod tests {
         workspace.scan(dir.path()).unwrap();
         let locations = workspace.find_references("Foo");
         // Foo.st has 1 occurrence (#Foo in #name value), method.st has 3
-        assert!(locations.len() >= 4, "expected at least 4 locations, got {}", locations.len());
+        assert!(
+            locations.len() >= 4,
+            "expected at least 4 locations, got {}",
+            locations.len()
+        );
     }
 
     #[test]
@@ -214,12 +235,14 @@ mod tests {
 
     #[test]
     fn test_find_class_info_after_scan() {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test/tonel/Dummy-Core");
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test/tonel/Dummy-Core");
         let workspace = Workspace::new();
         workspace.scan(&fixture_dir).unwrap();
 
-        let info = workspace.find_class_info("DmSubError").expect("DmSubError should have info");
+        let info = workspace
+            .find_class_info("DmSubError")
+            .expect("DmSubError should have info");
         assert_eq!(info.kind, "Class");
         assert!(info.inst_vars.contains(&"errorPrefix".to_string()));
         assert_eq!(info.superclass.as_deref(), Some("DmError"));
@@ -230,28 +253,69 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("Foo.st"),
-            "Class { #name: #Foo, #superclass: #Object, #instVars: ['x', 'y'] }",
-        ).unwrap();
+            "Class { #name: #Foo, #superclass: #Object, #instVars: ['x'] }",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("Bar.st"),
-            "Class { #name: #Bar, #superclass: #Object, #classVars: ['x'] }",
-        ).unwrap();
+            "Class { #name: #Bar, #superclass: #Object, #classVars: ['x'], #classInstVars: ['y'] }",
+        )
+        .unwrap();
 
         let workspace = Workspace::new();
         workspace.scan(dir.path()).unwrap();
 
-        let owners = workspace.find_var_owners("x");
+        let owners = workspace.find_var_owners("x", None);
         assert_eq!(owners.len(), 2);
-        let inst: Vec<_> = owners.iter().filter(|(_, inst)| *inst).collect();
-        let cls: Vec<_> = owners.iter().filter(|(_, inst)| !inst).collect();
+        let inst: Vec<_> = owners
+            .iter()
+            .filter(|(_, scope)| *scope == VarScope::Instance)
+            .collect();
+        let cls: Vec<_> = owners
+            .iter()
+            .filter(|(_, scope)| *scope == VarScope::ClassVariable)
+            .collect();
         assert_eq!(inst.len(), 1);
         assert_eq!(cls.len(), 1);
         assert_eq!(inst[0].0, "Foo");
         assert_eq!(cls[0].0, "Bar");
 
-        let y_owners = workspace.find_var_owners("y");
+        let y_owners = workspace.find_var_owners("y", None);
         assert_eq!(y_owners.len(), 1);
-        assert!(y_owners[0].1);
+        assert_eq!(y_owners[0].1, VarScope::ClassInstance);
+    }
+
+    #[test]
+    fn test_find_var_owners_by_method_side() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Foo.st"),
+            "Class { #name: #Foo, #superclass: #Object, #instVars: ['varA'], #classInstVars: ['varA'], #classVars: ['SharedA'] }",
+        )
+        .unwrap();
+
+        let workspace = Workspace::new();
+        workspace.scan(dir.path()).unwrap();
+
+        let instance_side = workspace.find_var_owners("varA", Some(MethodSide::Instance));
+        assert_eq!(instance_side, vec![("Foo".to_string(), VarScope::Instance)]);
+
+        let class_side = workspace.find_var_owners("varA", Some(MethodSide::Class));
+        assert_eq!(
+            class_side,
+            vec![("Foo".to_string(), VarScope::ClassInstance)]
+        );
+
+        let shared_instance = workspace.find_var_owners("SharedA", Some(MethodSide::Instance));
+        let shared_class = workspace.find_var_owners("SharedA", Some(MethodSide::Class));
+        assert_eq!(
+            shared_instance,
+            vec![("Foo".to_string(), VarScope::ClassVariable)]
+        );
+        assert_eq!(
+            shared_class,
+            vec![("Foo".to_string(), VarScope::ClassVariable)]
+        );
     }
 
     #[test]
@@ -267,7 +331,10 @@ mod tests {
         // Update the file: Bar replaced by Baz
         let src_v2 = SrcTree::new("Foo >> bar [ ^#Baz new ]".to_string());
         workspace.update(url.clone(), &src_v2);
-        assert!(workspace.find_references("Bar").is_empty(), "stale Bar ref should be removed");
+        assert!(
+            workspace.find_references("Bar").is_empty(),
+            "stale Bar ref should be removed"
+        );
         assert!(!workspace.find_references("Baz").is_empty());
     }
 }
