@@ -180,31 +180,33 @@ impl LanguageServer for Backend {
                 lines.join("\n")
             }),
             Some(ClassAtPos::NotUppercase(name)) => {
-                let method_side = self
-                    .document_map
-                    .get(uri)
-                    .and_then(|t| t.method_side_at_position(&pos.position));
-                let owners = self.workspace.find_var_owners(&name, method_side);
-                if owners.is_empty() {
-                    None
-                } else {
-                    let mut lines = Vec::new();
-                    for (class_name, scope) in owners {
-                        let scope_label = match scope {
-                            VarScope::Instance => "instance variable",
-                            VarScope::ClassVariable => "class variable",
-                            VarScope::ClassInstance => "class instance variable",
-                        };
-                        lines.push(format!(
-                            "`{}` ( {} of `{}` )",
-                            name, scope_label, class_name
-                        ));
+                let owners = self.document_map.get(uri).and_then(|t| {
+                    if t.is_local_variable_at_position(&pos.position) {
+                        return None;
                     }
-                    if lines.is_empty() {
+                    let method_side = t.method_side_at_position(&pos.position);
+                    Some(self.workspace.find_var_owners(&name, method_side))
+                });
+                if let Some(owners) = owners {
+                    if owners.is_empty() {
                         None
                     } else {
+                        let mut lines = Vec::new();
+                        for (class_name, scope) in owners {
+                            let scope_label = match scope {
+                                VarScope::Instance => "instance variable",
+                                VarScope::ClassVariable => "class variable",
+                                VarScope::ClassInstance => "class instance variable",
+                            };
+                            lines.push(format!(
+                                "`{}` ( {} of `{}` )",
+                                name, scope_label, class_name
+                            ));
+                        }
                         Some(lines.join("\n"))
                     }
+                } else {
+                    None
                 }
             }
             _ => None,

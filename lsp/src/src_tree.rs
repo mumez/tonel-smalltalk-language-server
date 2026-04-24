@@ -34,6 +34,26 @@ pub struct SrcTree {
 }
 
 impl SrcTree {
+    fn token_node_at_position(&self, pos: &Position) -> Option<Node<'_>> {
+        let point = tree_sitter::Point {
+            row: pos.line as usize,
+            column: pos.character as usize,
+        };
+        let root = self.tree.root_node();
+        let is_token = |k: &str| matches!(k, "identifier" | "string" | "symbol" | "ston_symbol");
+        root.descendant_for_point_range(point, point).and_then(|n| {
+            if !is_token(n.kind()) && point.column > 0 {
+                let prev = tree_sitter::Point {
+                    row: point.row,
+                    column: point.column - 1,
+                };
+                root.descendant_for_point_range(prev, prev)
+            } else {
+                Some(n)
+            }
+        })
+    }
+
     pub fn new(src: String) -> Self {
         let language = tree_sitter_tonel_smalltalk::language();
         let mut parser = Parser::new();
@@ -48,23 +68,8 @@ impl SrcTree {
 
     /// Resolves the token at `pos` to a class name (uppercase-first identifier/symbol/string).
     pub fn class_at_position(&self, pos: &Position) -> ClassAtPos {
-        let point = tree_sitter::Point {
-            row: pos.line as usize,
-            column: pos.character as usize,
-        };
         let is_token = |k: &str| matches!(k, "identifier" | "string" | "symbol" | "ston_symbol");
-        let root = self.tree.root_node();
-        let node = root.descendant_for_point_range(point, point).and_then(|n| {
-            if !is_token(n.kind()) && point.column > 0 {
-                let prev = tree_sitter::Point {
-                    row: point.row,
-                    column: point.column - 1,
-                };
-                root.descendant_for_point_range(prev, prev)
-            } else {
-                Some(n)
-            }
-        });
+        let node = self.token_node_at_position(pos);
         let Some(n) = node else {
             return ClassAtPos::NotNode;
         };
@@ -87,22 +92,7 @@ impl SrcTree {
 
     /// Returns method side at cursor position if inside a method definition.
     pub fn method_side_at_position(&self, pos: &Position) -> Option<MethodSide> {
-        let point = tree_sitter::Point {
-            row: pos.line as usize,
-            column: pos.character as usize,
-        };
-        let root = self.tree.root_node();
-        let node = root.descendant_for_point_range(point, point).or_else(|| {
-            if point.column > 0 {
-                let prev = tree_sitter::Point {
-                    row: point.row,
-                    column: point.column - 1,
-                };
-                root.descendant_for_point_range(prev, prev)
-            } else {
-                None
-            }
-        })?;
+        let node = self.token_node_at_position(pos)?;
 
         let mut cur = node;
         loop {
@@ -120,6 +110,32 @@ impl SrcTree {
         } else {
             Some(MethodSide::Instance)
         }
+    }
+
+    /// Returns true when the identifier at `pos` is a local temporary/argument.
+    pub fn is_local_variable_at_position(&self, pos: &Position) -> bool {
+        let Some(node) = self.token_node_at_position(pos) else {
+            return false;
+        };
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let Ok(name) = node.utf8_text(self.src.as_bytes()) else {
+            return false;
+        };
+
+        // Check nearest block scopes first (shadowing-aware, nearest wins).
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if n.kind() == "block" && block_declares_identifier(n, name, self.src.as_bytes()) {
+                return true;
+            }
+            if n.kind() == "method_definition" {
+                return method_declares_identifier(n, name, self.src.as_bytes());
+            }
+            cur = n.parent();
+        }
+        false
     }
 
     /// Returns all class-name occurrences in this file, grouped by name.
@@ -452,6 +468,63 @@ fn extract_ston_array_strings(node: tree_sitter::Node, src: &[u8]) -> Vec<String
         .collect()
 }
 
+fn node_has_identifier_named(node: Node<'_>, name: &str, src: &[u8]) -> bool {
+    if node.kind() == "identifier" {
+        return node.utf8_text(src).ok() == Some(name);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            if node_has_identifier_named(child, name, src) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn block_declares_identifier(block_node: Node<'_>, name: &str, src: &[u8]) -> bool {
+    for i in 0..block_node.named_child_count() {
+        let Some(child) = block_node.named_child(i as u32) else {
+            continue;
+        };
+        if matches!(child.kind(), "block_argument" | "temporaries")
+            && node_has_identifier_named(child, name, src)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn method_declares_identifier(method_node: Node<'_>, name: &str, src: &[u8]) -> bool {
+    for i in 0..method_node.named_child_count() {
+        let Some(child) = method_node.named_child(i as u32) else {
+            continue;
+        };
+        if child.kind() == "method_reference" {
+            let mut walk = child.walk();
+            for param in child.children_by_field_name("param", &mut walk) {
+                if node_has_identifier_named(param, name, src) {
+                    return true;
+                }
+            }
+        }
+        if child.kind() == "method_body" {
+            for j in 0..child.named_child_count() {
+                let Some(body_child) = child.named_child(j as u32) else {
+                    continue;
+                };
+                if body_child.kind() == "temporaries"
+                    && node_has_identifier_named(body_child, name, src)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Strip Tonel name decoration and return a plain class name.
 ///
 /// Handles all three forms that Tonel allows for `#name`:
@@ -680,5 +753,27 @@ mod tests {
         });
         assert_eq!(class_side, Some(MethodSide::Class));
         assert_eq!(instance_side, Some(MethodSide::Instance));
+    }
+
+    #[test]
+    fn test_is_local_variable_for_method_temporary() {
+        let src = "Class { #name: #ClassB, #superclass: #Object }\n\nClassB >> methodA [\n    | varA |\n    varA := ClassA new.\n]";
+        let tree = SrcTree::new(src.to_string());
+        let is_local = tree.is_local_variable_at_position(&Position {
+            line: 4,
+            character: 6,
+        });
+        assert!(is_local);
+    }
+
+    #[test]
+    fn test_is_local_variable_for_block_temporary() {
+        let src = "Class { #name: #ClassB, #superclass: #Object }\n\nClassB class >> methodB [\n    blockA := [ | varA |\n        varA := ClassA new.\n    ].\n]";
+        let tree = SrcTree::new(src.to_string());
+        let is_local = tree.is_local_variable_at_position(&Position {
+            line: 4,
+            character: 8,
+        });
+        assert!(is_local);
     }
 }
