@@ -9,9 +9,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::src_tree::{ClassAtPos, SrcTree};
 use crate::workspace::{VarScope, Workspace};
 
-/// Formats a hover markdown string for a variable, listing all owning classes.
-/// The `context_class` (if any) is placed first and rendered in bold to indicate
-/// it is the most relevant owner for the current editing context.
+// `context_class`, if given, is sorted first and rendered bold as the most relevant owner.
 fn format_var_owners_markdown(
     name: &str,
     mut owners: Vec<(String, VarScope)>,
@@ -217,7 +215,6 @@ impl LanguageServer for Backend {
                     }
                     Some(lines.join("\n"))
                 } else {
-                    // No class found — may be a class variable (uppercase names in classVars).
                     let (owners, context_class) = self
                         .document_map
                         .get(uri)
