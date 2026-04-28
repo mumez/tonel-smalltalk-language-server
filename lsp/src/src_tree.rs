@@ -112,6 +112,31 @@ impl SrcTree {
         }
     }
 
+    /// Returns the class name associated with the current context at `pos`.
+    /// For class definition files, returns the defined class name.
+    /// For method-only files, returns the receiver class from the enclosing method definition.
+    pub fn context_class_at_position(&self, pos: &Position) -> Option<String> {
+        if let Some(info) = self.class_info() {
+            return Some(info.name);
+        }
+        let node = self.token_node_at_position(pos)?;
+        let mut cur = node;
+        loop {
+            if cur.kind() == "method_definition" {
+                break;
+            }
+            cur = cur.parent()?;
+        }
+        let method_ref = (0..cur.named_child_count())
+            .filter_map(|i| cur.named_child(i as u32))
+            .find(|n| n.kind() == "method_reference")?;
+        let class_name_node = method_ref.child_by_field_name("class_name")?;
+        class_name_node
+            .utf8_text(self.src.as_bytes())
+            .ok()
+            .map(|s| s.to_string())
+    }
+
     /// Returns true when the identifier at `pos` is a local temporary/argument.
     pub fn is_local_variable_at_position(&self, pos: &Position) -> bool {
         let Some(node) = self.token_node_at_position(pos) else {
@@ -756,6 +781,57 @@ mod tests {
     }
 
     #[test]
+    fn test_class_info_with_class_vars() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/tonel/Dummy-Core/DmClassVarsExample.class.st");
+        let src = std::fs::read_to_string(&fixture).unwrap();
+        let tree = SrcTree::new(src);
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.name, "DmClassVarsExample");
+        assert!(
+            info.class_vars.contains(&"Registry".to_string()),
+            "expected Registry in class_vars: {:?}",
+            info.class_vars
+        );
+        assert!(info.inst_vars.is_empty());
+    }
+
+    #[test]
+    fn test_class_info_with_class_vars_inline() {
+        let src = "Class { #name: #Foo, #superclass: #Object, #classVars: ['Counter'] }";
+        let tree = SrcTree::new(src.to_string());
+        let info = tree.class_info().unwrap();
+        assert_eq!(info.class_vars, vec!["Counter".to_string()]);
+    }
+
+    #[test]
+    fn test_context_class_from_class_definition_file() {
+        // Class definition file: class_info() returns "Foo" directly.
+        let src = "Class { #name: #Foo, #superclass: #Object }\n\nFoo >> bar [\n    ^x\n]";
+        let tree = SrcTree::new(src.to_string());
+        let ctx = tree.context_class_at_position(&Position { line: 3, character: 5 });
+        assert_eq!(ctx.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn test_context_class_from_extension_file() {
+        // Extension file: class_info() returns None, so we fall back to method receiver.
+        let src = "Extension { #name: #Foo }\n\nFoo >> bar [\n    ^x\n]";
+        let tree = SrcTree::new(src.to_string());
+        let ctx = tree.context_class_at_position(&Position { line: 3, character: 5 });
+        assert_eq!(ctx.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn test_context_class_from_extension_class_side_method() {
+        // Extension file with class-side method.
+        let src = "Extension { #name: #Foo }\n\nFoo class >> bar [\n    ^x\n]";
+        let tree = SrcTree::new(src.to_string());
+        let ctx = tree.context_class_at_position(&Position { line: 3, character: 5 });
+        assert_eq!(ctx.as_deref(), Some("Foo"));
+    }
+
+    #[test]
     fn test_is_local_variable_for_method_temporary() {
         let src = "Class { #name: #ClassB, #superclass: #Object }\n\nClassB >> methodA [\n    | varA |\n    varA := ClassA new.\n]";
         let tree = SrcTree::new(src.to_string());
@@ -776,4 +852,5 @@ mod tests {
         });
         assert!(is_local);
     }
+
 }

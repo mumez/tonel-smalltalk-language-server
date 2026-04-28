@@ -319,6 +319,42 @@ mod tests {
     }
 
     #[test]
+    fn test_class_info_with_class_vars_fixture() {
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test/tonel/Dummy-Core");
+        let workspace = Workspace::new();
+        workspace.scan(&fixture_dir).unwrap();
+
+        let info = workspace
+            .find_class_info("DmClassVarsExample")
+            .expect("DmClassVarsExample should have info");
+        assert!(
+            info.class_vars.contains(&"Registry".to_string()),
+            "expected Registry in class_vars: {:?}",
+            info.class_vars
+        );
+    }
+
+    #[test]
+    fn test_find_var_owners_for_class_var_uppercase() {
+        // classVars have uppercase names; find_var_owners must locate them.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cls.st"),
+            "Class { #name: #Cls, #superclass: #Object, #classVars: ['Registry'] }",
+        )
+        .unwrap();
+
+        let workspace = Workspace::new();
+        workspace.scan(dir.path()).unwrap();
+
+        let owners = workspace.find_var_owners("Registry", None);
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].0, "Cls");
+        assert_eq!(owners[0].1, VarScope::ClassVariable);
+    }
+
+    #[test]
     fn test_update_refreshes_references() {
         let workspace = Workspace::new();
         let url = Url::parse("file:///tmp/method.st").unwrap();
