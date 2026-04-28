@@ -9,6 +9,41 @@ use tower_lsp::{Client, LanguageServer};
 use crate::src_tree::{ClassAtPos, SrcTree};
 use crate::workspace::{VarScope, Workspace};
 
+// `context_class`, if given, is sorted first and rendered bold as the most relevant owner.
+fn format_var_owners_markdown(
+    name: &str,
+    mut owners: Vec<(String, VarScope)>,
+    context_class: Option<&str>,
+) -> Option<String> {
+    if owners.is_empty() {
+        return None;
+    }
+    if let Some(ctx) = context_class {
+        owners.sort_by(|a, b| {
+            let a_is_ctx = a.0 == ctx;
+            let b_is_ctx = b.0 == ctx;
+            b_is_ctx.cmp(&a_is_ctx).then(a.0.cmp(&b.0))
+        });
+    }
+    let lines: Vec<String> = owners
+        .iter()
+        .map(|(class_name, scope)| {
+            let scope_label = match scope {
+                VarScope::Instance => "instance variable",
+                VarScope::ClassVariable => "class variable",
+                VarScope::ClassInstance => "class instance variable",
+            };
+            let is_ctx = context_class.map_or(false, |ctx| ctx == class_name);
+            if is_ctx {
+                format!("**`{}`** ( {} of **`{}`** )", name, scope_label, class_name)
+            } else {
+                format!("`{}` ( {} of `{}` )", name, scope_label, class_name)
+            }
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
+
 fn range_contains(outer: &Range, inner: &Range) -> bool {
     let start_ok = outer.start.line < inner.start.line
         || (outer.start.line == inner.start.line && outer.start.character <= inner.start.character);
@@ -153,61 +188,55 @@ impl LanguageServer for Backend {
         let (_, class_at_pos) = self.resolve_class_at(uri, &pos.position);
 
         let markdown = match class_at_pos {
-            Some(ClassAtPos::Found(name)) => self.workspace.find_class_info(&name).map(|info| {
-                let mut lines = Vec::new();
-                match info.superclass.as_deref() {
-                    Some(sc) => lines.push(format!("**{}** `{}` ▸ `{}`", info.kind, info.name, sc)),
-                    None => lines.push(format!("**{}** `{}`", info.kind, info.name)),
+            Some(ClassAtPos::Found(name)) => {
+                if let Some(info) = self.workspace.find_class_info(&name) {
+                    let mut lines = Vec::new();
+                    match info.superclass.as_deref() {
+                        Some(sc) => lines.push(format!("**{}** `{}` ▸ `{}`", info.kind, info.name, sc)),
+                        None => lines.push(format!("**{}** `{}`", info.kind, info.name)),
+                    }
+                    if !info.inst_vars.is_empty() {
+                        let vars = info
+                            .inst_vars
+                            .iter()
+                            .map(|v| format!("`{}`", v))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(format!("\ninstVars: {}", vars));
+                    }
+                    if !info.class_vars.is_empty() {
+                        let vars = info
+                            .class_vars
+                            .iter()
+                            .map(|v| format!("`{}`", v))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(format!("classVars: {}", vars));
+                    }
+                    Some(lines.join("\n"))
+                } else {
+                    let (owners, context_class) = self
+                        .document_map
+                        .get(uri)
+                        .map(|t| {
+                            let method_side = t.method_side_at_position(&pos.position);
+                            let context_class = t.context_class_at_position(&pos.position);
+                            (self.workspace.find_var_owners(&name, method_side), context_class)
+                        })
+                        .unwrap_or_default();
+                    format_var_owners_markdown(&name, owners, context_class.as_deref())
                 }
-                if !info.inst_vars.is_empty() {
-                    let vars = info
-                        .inst_vars
-                        .iter()
-                        .map(|v| format!("`{}`", v))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    lines.push(format!("\ninstVars: {}", vars));
-                }
-                if !info.class_vars.is_empty() {
-                    let vars = info
-                        .class_vars
-                        .iter()
-                        .map(|v| format!("`{}`", v))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    lines.push(format!("classVars: {}", vars));
-                }
-                lines.join("\n")
-            }),
+            }
             Some(ClassAtPos::NotUppercase(name)) => {
-                let owners = self.document_map.get(uri).and_then(|t| {
+                self.document_map.get(uri).and_then(|t| {
                     if t.is_local_variable_at_position(&pos.position) {
                         return None;
                     }
                     let method_side = t.method_side_at_position(&pos.position);
-                    Some(self.workspace.find_var_owners(&name, method_side))
-                });
-                if let Some(owners) = owners {
-                    if owners.is_empty() {
-                        None
-                    } else {
-                        let mut lines = Vec::new();
-                        for (class_name, scope) in owners {
-                            let scope_label = match scope {
-                                VarScope::Instance => "instance variable",
-                                VarScope::ClassVariable => "class variable",
-                                VarScope::ClassInstance => "class instance variable",
-                            };
-                            lines.push(format!(
-                                "`{}` ( {} of `{}` )",
-                                name, scope_label, class_name
-                            ));
-                        }
-                        Some(lines.join("\n"))
-                    }
-                } else {
-                    None
-                }
+                    let context_class = t.context_class_at_position(&pos.position);
+                    let owners = self.workspace.find_var_owners(&name, method_side);
+                    format_var_owners_markdown(&name, owners, context_class.as_deref())
+                })
             }
             _ => None,
         };
