@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "tonel-smalltalk-language-server"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -952,8 +952,8 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "tree-sitter-tonel-smalltalk"
-version = "0.2.0"
-source = "git+https://github.com/mumez/tree-sitter-tonel-smalltalk?tag=v0.2.0#382bfaf5a74d7b7497075b34a51d2d739612cac2"
+version = "0.2.4"
+source = "git+https://github.com/mumez/tree-sitter-tonel-smalltalk?tag=v0.2.4#f44141b81c6ef5ebd14ddc4772bfd8620a8e1e19"
 dependencies = [
  "cc",
  "tree-sitter",
