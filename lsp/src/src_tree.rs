@@ -199,13 +199,6 @@ impl SrcTree {
         map
     }
 
-    /// Returns all LSP Ranges where `class_name` appears.
-    pub fn find_class_references(&self, class_name: &str) -> Vec<Range> {
-        self.all_class_references()
-            .remove(class_name)
-            .unwrap_or_default()
-    }
-
     /// Returns all syntax error diagnostics derived from the tree-sitter parse result.
     /// Uses ERROR nodes (unexpected tokens) and MISSING nodes (absent expected tokens).
     pub fn syntax_errors(&self) -> Vec<Diagnostic> {
@@ -628,28 +621,37 @@ mod tests {
     }
 
     #[test]
-    fn test_find_class_references_all_forms() {
+    fn test_all_class_references_all_forms() {
         // Method file referencing a class in all three forms.
         let src = "Foo >> bar [\n    | a b c |\n    a := #ClassName new.\n    b := #'ClassName' new.\n    c := 'ClassName' new.\n    ^a\n]";
         let tree = SrcTree::new(src.to_string());
-        let refs = tree.find_class_references("ClassName");
-        assert_eq!(refs.len(), 3, "expected 3 references, got {:?}", refs);
+        let refs = tree.all_class_references();
+        assert_eq!(
+            refs.get("ClassName").map(|r| r.len()),
+            Some(3),
+            "expected 3 references, got {:?}",
+            refs.get("ClassName")
+        );
     }
 
     #[test]
-    fn test_find_class_references_in_class_definition() {
+    fn test_all_class_references_in_class_definition() {
         // Class definition file — the class name itself and superclass are both references.
         let src = "Class { #name: #Foo, #superclass: #Object }";
         let tree = SrcTree::new(src.to_string());
-        let refs = tree.find_class_references("Foo");
-        assert!(!refs.is_empty(), "expected at least one reference to Foo");
+        let refs = tree.all_class_references();
+        assert!(
+            refs.get("Foo").is_some_and(|r| !r.is_empty()),
+            "expected at least one reference to Foo"
+        );
     }
 
     #[test]
-    fn test_find_class_references_no_match() {
+    fn test_all_class_references_no_match() {
         let src = "Foo >> bar [ ^#Bar new ]";
         let tree = SrcTree::new(src.to_string());
-        assert!(tree.find_class_references("Baz").is_empty());
+        let refs = tree.all_class_references();
+        assert!(refs.get("Baz").is_none());
     }
 
     #[test]
