@@ -1,0 +1,8 @@
+{
+  "tonel-smalltalk": {
+    "command": "tonel-smalltalk-language-server",
+    "extensionToLanguage": {
+      ".st": "smalltalk"
+    }
+  }
+}
