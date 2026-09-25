@@ -28,6 +28,22 @@ Place the binary on your PATH:
 cp target/release/tonel-smalltalk-language-server ~/.local/bin/
 ```
 
+### Claude Code
+
+This repository is also a Claude Code plugin marketplace providing the `tonel-smalltalk-lsp` plugin, which connects the language server to `.st` files. The plugin does not bundle the binary, so place `tonel-smalltalk-language-server` on your PATH first (see above).
+
+```bash
+claude plugin marketplace add mumez/tonel-smalltalk-language-server
+claude plugin install tonel-smalltalk-lsp@tonel-smalltalk-language-server
+```
+
+Or inside a Claude Code session:
+
+```
+/plugin marketplace add mumez/tonel-smalltalk-language-server
+/plugin install tonel-smalltalk-lsp@tonel-smalltalk-language-server
+```
+
 ## Development
 
 Run the tests:

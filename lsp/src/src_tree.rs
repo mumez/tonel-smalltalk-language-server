@@ -386,31 +386,9 @@ impl SrcTree {
         let raw = name_node.utf8_text(self.src.as_bytes()).ok()?;
         let class_name = normalize_class_name(raw).to_string();
 
-        // Walk up to find the enclosing class_definition or trait_definition node
-        // in order to get its Range for go-to-definition.
-        let mut def_node = name_node;
-        loop {
-            match def_node.kind() {
-                "class_definition" | "trait_definition" => break,
-                _ => def_node = def_node.parent()?,
-            }
-        }
-
-        let start = def_node.start_position();
-        let end = def_node.end_position();
-        Some((
-            class_name,
-            Range {
-                start: Position {
-                    line: start.row as u32,
-                    character: start.column as u32,
-                },
-                end: Position {
-                    line: end.row as u32,
-                    character: end.column as u32,
-                },
-            },
-        ))
+        // Point go-to-definition at the name token itself, matching the
+        // range reported for the same token by find_class_references().
+        Some((class_name, node_to_range(&name_node)))
     }
 }
 
@@ -548,6 +526,19 @@ pub fn normalize_class_name(raw: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn single_line_range(line: u32, start: u32, end: u32) -> Range {
+        Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        }
+    }
+
     fn assert_fixture_class(relative_path: &str, expected: &str) {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
         let src = std::fs::read_to_string(&fixture).expect("fixture not found");
@@ -566,8 +557,9 @@ mod tests {
         let tree = SrcTree::new(src.to_string());
         let result = tree.defined_class();
         assert!(result.is_some());
-        let (name, _range) = result.unwrap();
+        let (name, range) = result.unwrap();
         assert_eq!(name, "Foo");
+        assert_eq!(range, single_line_range(0, 15, 19));
     }
 
     #[test]
@@ -576,8 +568,9 @@ mod tests {
         let tree = SrcTree::new(src.to_string());
         let result = tree.defined_class();
         assert!(result.is_some());
-        let (name, _range) = result.unwrap();
+        let (name, range) = result.unwrap();
         assert_eq!(name, "Foo");
+        assert_eq!(range, single_line_range(0, 16, 21));
     }
 
     #[test]
@@ -586,8 +579,9 @@ mod tests {
         let tree = SrcTree::new(src.to_string());
         let result = tree.defined_class();
         assert!(result.is_some());
-        let (name, _range) = result.unwrap();
+        let (name, range) = result.unwrap();
         assert_eq!(name, "Foo");
+        assert_eq!(range, single_line_range(0, 16, 22));
     }
 
     #[test]
@@ -596,8 +590,9 @@ mod tests {
         let tree = SrcTree::new(src.to_string());
         let result = tree.defined_class();
         assert!(result.is_some());
-        let (name, _range) = result.unwrap();
+        let (name, range) = result.unwrap();
         assert_eq!(name, "MyTrait");
+        assert_eq!(range, single_line_range(0, 15, 23));
     }
 
     #[test]

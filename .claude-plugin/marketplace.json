@@ -1,0 +1,15 @@
+{
+  "name": "tonel-smalltalk-language-server",
+  "description": "Claude Code plugin for the Tonel-Smalltalk language server",
+  "owner": {
+    "name": "Masashi Umezawa",
+    "email": "ume@softumeya.com"
+  },
+  "plugins": [
+    {
+      "name": "tonel-smalltalk-lsp",
+      "source": "./",
+      "description": "Tonel-Smalltalk language server integration for Claude Code"
+    }
+  ]
+}
